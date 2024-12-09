@@ -51,7 +51,7 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
 
     # Various tiling dimensions
     c_in_pmax = nl.tile_size.pmax
-    c_out_pmax = nl.tile_size.pmax
+    c_out_pmax = c_in_pmax
     n_tiles_c_in = in_channels // c_in_pmax
     n_tiles_c_out = out_channels // c_out_pmax
 
@@ -109,12 +109,12 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
        buffer=nl.sbuf
     )
 
-    for fh in nl.affine_range(filter_height):
-        for fw in nl.affine_range(filter_width):
+    for i in nl.affine_range(filter_height):
+        for j in nl.affine_range(filter_width):
             for block in nl.affine_range(n_tiles_c_out):
                 for depth in nl.affine_range(n_tiles_c_in):
-                    w_moved[fh, fw, block, depth] = nl.copy(w_tiled[block, :, depth, :, fh, fw])
-                    w[fh,fw, block, depth] = nisa.nc_transpose(w_moved[fh, fw, block, depth])
+                    w_moved[i, j, block, depth] = nl.copy(w_tiled[block, :, depth, :, i, j])
+                    w[i,j, block, depth] = nisa.nc_transpose(w_moved[i, j, block, depth])
 
 
     out_height = input_height - filter_height + 1
@@ -147,38 +147,46 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
 
             tile_start = out_tile * n_rows_out_tile
             tile_end = tile_start + n_rows_out_tile
-            for cin in nl.affine_range(n_tiles_c_in):
+            for c_in_tile in nl.affine_range(n_tiles_c_in):
                 # load part of input image corresponding to filter tiles
-                x[cin, :, :, :] = nl.load(X[img, cin * 128: cin * 128 + 128, tile_start: tile_start + input_tile_height, :])
+                x[c_in_tile, :, :, :] = nl.load(
+                    X[
+                        img,
+                        c_in_tile * 128: c_in_tile * 128 + 128,
+                        tile_start: tile_start + input_tile_height,
+                        :
+                    ]
+                )
 
             # apply one filter at a time
-            for block in nl.affine_range(n_tiles_c_out):
+            for c_out_tile in nl.affine_range(n_tiles_c_out):
                 #asign space in SBUF to store output
                 output = nl.ndarray(shape=(nl.par_dim(c_out_pmax), n_rows_out_tile, out_width),
                     dtype=X_out[img].dtype,
                     buffer=nl.sbuf)
 
+                b = nl.load(bias[c_out_tile * 128 : c_out_tile * 128 + 128])
                 # loop over output rows
                 for out_row in nl.affine_range(n_rows_out_tile):
                     # assign space in PSUM to store output row
                     row_out = nl.zeros((nl.par_dim(c_out_pmax), out_width), nl.float32, buffer=nl.psum)
 
-                    for fh in nl.affine_range(filter_height):
-                        for fw in nl.affine_range(filter_width):
+                    for i in nl.affine_range(filter_height):
+                        for j in nl.affine_range(filter_width):
                             # for each spatial position in the filter
-                            for cin in nl.affine_range(n_tiles_c_in):
+                            for c_in_tile in nl.affine_range(n_tiles_c_in):
                                 # Perform matrix multiplication and accumulate in PSUM
                                 row_out += nl.matmul(
-                                    w[fh, fw, block, cin, :, :],
-                                    x[cin, :, out_row + fh, fw : fw + out_width],
+                                    w[i, j, c_out_tile, c_in_tile, :, :],
+                                    x[c_in_tile, :, out_row + i, j : j + out_width],
                                     transpose_x=True
                                 )
 
                     #temp = nl.copy(temp, dtype=output[:, out_row, :].dtype)
                     # copy stuff from PSUM back to SBUF
-                    output[:, out_row, :] = nl.add(row_out, nl.load(bias[block * 128 : block * 128 + 128]))
+                    output[:, out_row, :] = nl.add(row_out, b)
 
                 # copy stuff from SBUF back to HBM
-                nl.store(X_out[img, block * 128 : block * 128 + 128, tile_start:tile_end, :], value=output)
+                nl.store(X_out[img, c_out_tile * 128 : c_out_tile * 128 + 128, tile_start:tile_end, :], value=output)
 
     return X_out
